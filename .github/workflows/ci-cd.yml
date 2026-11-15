@@ -1,0 +1,291 @@
+name: CI and container delivery
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Detect project manifests
+        id: detect
+        shell: bash
+        run: |
+          node=false
+          go=false
+          maven=false
+          gradle=false
+          python=false
+          supported=false
+
+          if [ -f package.json ]; then node=true; supported=true; fi
+          if [ -f go.mod ]; then go=true; supported=true; fi
+          if [ -f pom.xml ]; then maven=true; supported=true; fi
+          if [ -f build.gradle ] || [ -f build.gradle.kts ] || [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
+            gradle=true
+            supported=true
+          fi
+          if [ -f requirements.txt ] || [ -f pyproject.toml ]; then python=true; supported=true; fi
+
+          echo "node=$node" >> "$GITHUB_OUTPUT"
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+          echo "maven=$maven" >> "$GITHUB_OUTPUT"
+          echo "gradle=$gradle" >> "$GITHUB_OUTPUT"
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          echo "supported=$supported" >> "$GITHUB_OUTPUT"
+
+      - name: Require a project manifest when configured
+        if: steps.detect.outputs.supported != 'true'
+        env:
+          CI_REQUIRE_MANIFEST: ${{ vars.CI_REQUIRE_MANIFEST }}
+        run: |
+          if [ "$CI_REQUIRE_MANIFEST" = "true" ]; then
+            echo "::error::지원되는 프로젝트 파일을 저장소 루트에서 찾지 못했습니다."
+            exit 1
+          fi
+          echo "::notice::프로젝트 파일이 아직 없어 빌드 및 테스트 단계를 건너뜁니다."
+
+      - name: Select Node package manager
+        if: steps.detect.outputs.node == 'true'
+        id: package-manager
+        shell: bash
+        run: |
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            echo "name=bun" >> "$GITHUB_OUTPUT"
+          elif [ -f pnpm-lock.yaml ]; then
+            echo "name=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f yarn.lock ]; then
+            echo "name=yarn" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=npm" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        if: steps.detect.outputs.node == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Set up Bun
+        if: steps.package-manager.outputs.name == 'bun'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Node dependencies
+        if: steps.detect.outputs.node == 'true'
+        env:
+          PACKAGE_MANAGER: ${{ steps.package-manager.outputs.name }}
+        shell: bash
+        run: |
+          case "$PACKAGE_MANAGER" in
+            npm)
+              if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi
+              ;;
+            pnpm)
+              corepack enable
+              corepack pnpm install --frozen-lockfile
+              ;;
+            yarn)
+              corepack enable
+              yarn_version=$(corepack yarn --version)
+              yarn_major=$(printf '%s' "$yarn_version" | cut -d. -f1)
+              if [ "$yarn_major" = "1" ]; then
+                corepack yarn install --frozen-lockfile
+              else
+                corepack yarn install --immutable
+              fi
+              ;;
+            bun)
+              bun install --frozen-lockfile
+              ;;
+            *)
+              echo "::error::지원하지 않는 Node 패키지 매니저입니다."
+              exit 1
+              ;;
+          esac
+
+      - name: Run Node project scripts
+        if: steps.detect.outputs.node == 'true'
+        env:
+          PACKAGE_MANAGER: ${{ steps.package-manager.outputs.name }}
+        shell: bash
+        run: |
+          for script in lint typecheck test build; do
+            if CHECK_SCRIPT="$script" node -e 'const scripts = require("./package.json").scripts || {}; process.exit(scripts[process.env.CHECK_SCRIPT] ? 0 : 1)'; then
+              echo "Running $script"
+              case "$PACKAGE_MANAGER" in
+                npm) npm run "$script" ;;
+                pnpm) corepack pnpm run "$script" ;;
+                yarn) corepack yarn run "$script" ;;
+                bun) bun run "$script" ;;
+              esac
+            else
+              echo "::notice::package.json에 $script script가 없어 건너뜁니다."
+            fi
+          done
+
+      - name: Set up Go
+        if: steps.detect.outputs.go == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Test and vet Go project
+        if: steps.detect.outputs.go == 'true'
+        run: |
+          go test ./...
+          go vet ./...
+
+      - name: Select Java version
+        if: steps.detect.outputs.maven == 'true' || steps.detect.outputs.gradle == 'true'
+        id: java-version
+        shell: bash
+        run: |
+          version=21
+          if [ -f .java-version ]; then version=$(cat .java-version); fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        if: steps.detect.outputs.maven == 'true' || steps.detect.outputs.gradle == 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ steps.java-version.outputs.version }}
+
+      - name: Verify Maven project
+        if: steps.detect.outputs.maven == 'true'
+        shell: bash
+        run: |
+          if [ -f ./mvnw ]; then
+            chmod +x ./mvnw
+            ./mvnw --batch-mode verify
+          else
+            mvn --batch-mode verify
+          fi
+
+      - name: Build Gradle project
+        if: steps.detect.outputs.gradle == 'true'
+        shell: bash
+        run: |
+          if [ ! -f ./gradlew ]; then
+            echo "::error::Gradle 프로젝트에는 Gradle Wrapper(gradlew)를 추가해 주세요."
+            exit 1
+          fi
+          chmod +x ./gradlew
+          ./gradlew build --no-daemon
+
+      - name: Select Python version
+        if: steps.detect.outputs.python == 'true'
+        id: python-version
+        shell: bash
+        run: |
+          version=3.12
+          if [ -f .python-version ]; then version=$(cat .python-version); fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.detect.outputs.python == 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ steps.python-version.outputs.version }}
+
+      - name: Install Python dependencies and run configured checks
+        if: steps.detect.outputs.python == 'true'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ] && grep -Fq '[build-system]' pyproject.toml; then python -m pip install -e .; fi
+
+          if [ -f pyproject.toml ] && grep -Fq 'tool.ruff' pyproject.toml || [ -f ruff.toml ] || [ -f .ruff.toml ]; then
+            python -m pip install ruff
+            python -m ruff check .
+          fi
+
+          if find . -path './.git' -prune -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit | grep -q .; then
+            python -m pip install pytest
+            python -m pytest
+          else
+            echo "::notice::Python 테스트 파일을 찾지 못해 테스트를 건너뜁니다."
+          fi
+
+  publish-image:
+    name: Publish image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Check for Dockerfile
+        id: dockerfile
+        shell: bash
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::저장소 루트에 Dockerfile이 없어 이미지 게시를 건너뜁니다."
+          fi
+
+      - name: Normalize image name
+        if: steps.dockerfile.outputs.present == 'true'
+        id: image
+        shell: bash
+        run: |
+          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/$image_name" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.dockerfile.outputs.present == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        if: steps.dockerfile.outputs.present == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags and labels
+        if: steps.dockerfile.outputs.present == 'true'
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build and publish image
+        if: steps.dockerfile.outputs.present == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+

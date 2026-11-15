@@ -1,0 +1,145 @@
+name: Discord notifications
+
+on:
+  issues:
+    types: [opened, edited, closed, reopened, assigned]
+  pull_request:
+    types: [opened, reopened, closed, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  issues: read
+  pull-requests: read
+
+jobs:
+  notify:
+    name: Send Discord notification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check webhook secret
+        id: webhook
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::DISCORD_WEBHOOK_URL is not set; Discord notification was skipped."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        if: steps.webhook.outputs.configured == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Send event to Discord
+        if: steps.webhook.outputs.configured == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_ACTION: ${{ github.event.action }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+          const eventName = process.env.GITHUB_EVENT_NAME;
+          const eventAction = process.env.GITHUB_EVENT_ACTION || "updated";
+          const repository = process.env.GITHUB_REPOSITORY;
+          const actor = process.env.GITHUB_ACTOR;
+          const truncate = (value, max = 1024) => {
+            const text = String(value || "-");
+            return text.length > max ? text.slice(0, max - 1) + "…" : text;
+          };
+
+          let item;
+          let title;
+          let url;
+          let fields = [
+            { name: "저장소", value: truncate(repository, 256), inline: true },
+            { name: "작업자", value: truncate(actor, 256), inline: true }
+          ];
+          let color = 0x5865f2;
+
+          if (eventName === "issues") {
+            item = event.issue;
+            const labels = (item.labels || []).map((label) => label.name).join(", ") || "-";
+            const assignee = item.assignee ? item.assignee.login : "-";
+            const actions = {
+              opened: "이슈 생성",
+              edited: "이슈 수정",
+              closed: "이슈 종료",
+              reopened: "이슈 재개",
+              assigned: "이슈 담당자 지정"
+            };
+            title = actions[eventAction] || "이슈 변경";
+            url = item.html_url;
+            fields.push({ name: "라벨", value: truncate(labels), inline: true });
+            fields.push({ name: "담당자", value: truncate(assignee, 256), inline: true });
+            if (eventAction === "closed") color = 0x808080;
+          } else if (eventName === "pull_request") {
+            item = event.pull_request;
+            const actions = {
+              opened: "PR 생성",
+              reopened: "PR 재개",
+              closed: item.merged ? "PR 병합" : "PR 종료",
+              ready_for_review: "PR 리뷰 준비 완료"
+            };
+            title = actions[eventAction] || "PR 변경";
+            url = item.html_url;
+            fields.push({
+              name: "브랜치",
+              value: truncate(String(item.head.ref) + " → " + String(item.base.ref), 1024),
+              inline: false
+            });
+            if (eventAction === "closed" && item.merged) color = 0x8957e5;
+            else if (eventAction === "closed") color = 0x808080;
+          } else {
+            item = event.pull_request;
+            const state = event.review && event.review.state ? event.review.state : "submitted";
+            const reviewNames = {
+              approved: "리뷰 승인",
+              changes_requested: "변경 요청 리뷰",
+              commented: "리뷰 의견 등록"
+            };
+            title = reviewNames[state] || "PR 리뷰 등록";
+            url = item.html_url;
+            fields.push({
+              name: "리뷰어",
+              value: truncate(event.review && event.review.user ? event.review.user.login : actor, 256),
+              inline: true
+            });
+            fields.push({ name: "리뷰 상태", value: truncate(state, 256), inline: true });
+            if (state === "approved") color = 0x2da44e;
+            if (state === "changes_requested") color = 0xcf222e;
+          }
+
+          const payload = {
+            allowed_mentions: { parse: [] },
+            embeds: [{
+              title: truncate(title + ": " + item.title, 256),
+              url,
+              color,
+              fields,
+              footer: { text: repository },
+              timestamp: new Date().toISOString()
+            }]
+          };
+
+          const response = await fetch(process.env.DISCORD_WEBHOOK_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+
+          if (!response.ok) {
+            throw new Error("Discord webhook returned HTTP " + response.status);
+          }
+          NODE
+
