@@ -1,0 +1,100 @@
+name: Conventions
+
+on:
+  pull_request:
+    branches: [develop, main]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  conventions:
+    name: Conventions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Validate branch flow, title, and commits
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          node <<'NODE'
+          const { execFileSync } = require("node:child_process");
+
+          const fail = (message) => {
+            console.error("::error::" + message);
+            process.exitCode = 1;
+          };
+          const base = process.env.BASE_REF;
+          const head = process.env.HEAD_REF;
+          const title = (process.env.PR_TITLE || "").normalize("NFC");
+          const hasKorean = (value) => /[가-힣]/u.test(value);
+          const length = (value) => [...value].length;
+
+          if (base === "develop") {
+            const branch = head.match(/^(feature|fix|refactor)\/#([1-9][0-9]*)-([a-z0-9]+(?:-[a-z0-9]+)*)$/);
+            if (!branch) {
+              fail("develop 대상 작업 브랜치는 feature|fix|refactor/#이슈번호-영어-kebab-case 형식이어야 합니다.");
+            }
+
+            const pr = title.match(/^\[(feature|fix|refactor)\] (.+) \(#[1-9][0-9]*\)$/u);
+            if (!pr) {
+              fail("PR 제목은 [feature|fix|refactor] 한국어 작업 내용 (#이슈번호) 형식이어야 합니다.");
+            } else {
+              const titleIssue = title.match(/\(#([1-9][0-9]*)\)$/u);
+              if (branch && pr[1] !== branch[1]) {
+                fail("PR 제목의 유형은 작업 브랜치 유형과 같아야 합니다.");
+              }
+              if (branch && titleIssue && titleIssue[1] !== branch[2]) {
+                fail("PR 제목의 Issue 번호는 작업 브랜치의 Issue 번호와 같아야 합니다.");
+              }
+            }
+          } else if (base === "main") {
+            if (head !== "develop") {
+              fail("main으로 향하는 PR은 develop 브랜치에서만 생성할 수 있습니다.");
+            }
+            if (!/^\[develop\] .+ \(#[1-9][0-9]*\)$/u.test(title)) {
+              fail("main 배포 PR 제목은 [develop] 한국어 배포 내용 (#배포 Issue 번호) 형식이어야 합니다.");
+            }
+          } else {
+            fail("PR 대상 브랜치는 develop 또는 main이어야 합니다.");
+          }
+
+          if (length(title) > 50) fail("PR 제목은 공백 포함 50자 이내여야 합니다.");
+          if (!hasKorean(title)) fail("PR 제목은 한국어로 작성해야 합니다.");
+          if (title.includes(".")) fail("PR 제목에는 마침표를 사용할 수 없습니다.");
+
+          try {
+            execFileSync("git", ["fetch", "--no-tags", "origin", base], { stdio: "ignore" });
+            const subjects = execFileSync(
+              "git",
+              ["log", "--no-merges", "--format=%s", "FETCH_HEAD..HEAD"],
+              { encoding: "utf8" }
+            ).split("\n").filter(Boolean);
+
+            if (subjects.length === 0) {
+              fail("검사할 PR 커밋을 찾지 못했습니다.");
+            }
+
+            const commitPattern = /^(feat|fix|docs|refactor|ci|revert|chore): .+$/u;
+            for (const raw of subjects) {
+              const subject = raw.normalize("NFC");
+              if (!commitPattern.test(subject)) {
+                fail("커밋 제목 형식이 올바르지 않습니다: " + subject);
+                continue;
+              }
+              if (length(subject) > 50) fail("커밋 제목은 50자 이내여야 합니다: " + subject);
+              if (!hasKorean(subject)) fail("커밋 제목은 한국어로 작성해야 합니다: " + subject);
+            }
+          } catch (error) {
+            fail("PR 커밋을 비교하지 못했습니다: " + error.message);
+          }
+          NODE
+
