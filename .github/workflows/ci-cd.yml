@@ -295,7 +295,9 @@ jobs:
     name: Deploy to G10 home server
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' && needs.publish-image.outputs.image-published == 'true'
     needs: publish-image
-    runs-on: [self-hosted, linux, x64, g10-home-server]
+    runs-on:
+      group: g10-deploy
+      labels: g10-home-server  
     permissions:
       packages: read
     steps:
