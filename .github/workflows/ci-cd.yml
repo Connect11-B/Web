@@ -232,6 +232,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image-published: ${{ steps.dockerfile.outputs.present }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -275,7 +277,7 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
-            type=sha,prefix=sha-
+            type=sha,format=long,prefix=sha-
 
       - name: Build and publish image
         if: steps.dockerfile.outputs.present == 'true'
@@ -288,4 +290,57 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to G10 home server
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true' && needs.publish-image.outputs.image-published == 'true'
+    needs: publish-image
+    runs-on: [self-hosted, linux, x64, g10-home-server]
+    permissions:
+      packages: read
+    steps:
+      - name: Validate home server deployment settings
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          DEPLOY_SERVICE: ${{ vars.DEPLOY_SERVICE }}
+          IMAGE_TAG: sha-${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_PATH" ]; then
+            echo "::error::Set the Actions variable DEPLOY_PATH to the directory containing the Compose file."
+            exit 1
+          fi
+          if [ -z "$DEPLOY_SERVICE" ]; then
+            echo "::error::Set the Actions variable DEPLOY_SERVICE to the Compose service name."
+            exit 1
+          fi
+          if [ ! -d "$DEPLOY_PATH" ]; then
+            echo "::error::DEPLOY_PATH does not exist on the home server."
+            exit 1
+          fi
+          cd "$DEPLOY_PATH"
+          docker compose version
+          IMAGE_TAG="$IMAGE_TAG" docker compose config --quiet
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          logout: true
+
+      - name: Pull and restart the updated service
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          DEPLOY_SERVICE: ${{ vars.DEPLOY_SERVICE }}
+          IMAGE_TAG: sha-${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          IMAGE_TAG="$IMAGE_TAG" docker compose pull "$DEPLOY_SERVICE"
+          IMAGE_TAG="$IMAGE_TAG" docker compose up -d --no-deps "$DEPLOY_SERVICE"
+          docker compose ps "$DEPLOY_SERVICE"
 
